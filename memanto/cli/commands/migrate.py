@@ -39,6 +39,7 @@ from memanto.cli.analyze.langfuse_export import (
     normalize_host,
     run_langfuse_export,
 )
+from memanto.cli.analyze.chatgpt_export import run_chatgpt_export
 from memanto.cli.analyze.letta_compare import (
     build_llm_prompt as build_letta_llm_prompt,
 )
@@ -126,6 +127,16 @@ _PROVIDER_BUNDLES: dict[str, dict[str, Any]] = {
         "label": "Langfuse",
         "exporter": run_langfuse_export,
         "export_filename": "langfuse_export.json",
+    },
+    # ChatGPT carries no savings report either: the source is a static
+    # conversations.json file, not a metered SaaS plan, so there is no
+    # token/storage/latency delta to quantify. Like langfuse it only needs
+    # `label` + `exporter`; the file path comes from the `--file` argument
+    # (see `_run_chatgpt_flow`).
+    "chatgpt": {
+        "label": "ChatGPT",
+        "exporter": run_chatgpt_export,
+        "export_filename": "chatgpt_export.json",
     },
 }
 
@@ -1158,4 +1169,162 @@ def migrate_langfuse(
             ),
             border_style=border,
         )
+    )
+
+
+# --------------------------------------------------------------------------
+# ChatGPT — file-based, no API key. The "export" step is a local transform of
+# the user's conversations.json, so `--file` here points at the *raw* ChatGPT
+# data export, not an already-mapped JSON like the other providers.
+# --------------------------------------------------------------------------
+
+
+def _run_chatgpt_flow(
+    *,
+    file: Path | None,
+    include_assistant: bool,
+    agent: str | None,
+    dry_run: bool,
+) -> None:
+    """Migrate a ChatGPT data export (conversations.json) into Memanto."""
+    bundle = _PROVIDER_BUNDLES["chatgpt"]
+    label = bundle["label"]
+
+    if file is None:
+        _error(
+            "ChatGPT migration needs your data export file.",
+            hint=(
+                "Download it from https://chatgpt.com/#settings/DataControls "
+                "(\"Export data\"), unzip it, then pass "
+                "--file path/to/conversations.json"
+            ),
+        )
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_dir = config_manager.get_migrate_dir("chatgpt") / stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    mode = "Dry run" if dry_run else "Migrate"
+    console.print(
+        Panel.fit(
+            f"[{BOLD_PRIMARY}]{label} -> Memanto  {mode}[/{BOLD_PRIMARY}]",
+            border_style=PRIMARY,
+        )
+    )
+
+    def progress(msg: str) -> None:
+        console.print(f"  [{BRIGHT}]…[/{BRIGHT}] {msg}")
+
+    # Step 1 — resolve target only if we will actually write.
+    target_agent = None if dry_run else _resolve_target_agent(agent)
+
+    # Step 2 — transform the raw conversations.json into a provider export.
+    try:
+        export_path, export = run_chatgpt_export(
+            file,
+            run_dir,
+            include_assistant=include_assistant,
+            on_progress=progress,
+        )
+    except ValueError as exc:
+        _error(str(exc))
+
+    # Step 3 — map (and optionally write).
+    progress("Mapping ChatGPT messages onto the Memanto schema...")
+    client = None if dry_run else get_client()
+    summary, rows = run_migration(
+        provider="chatgpt",
+        export=export,
+        client=client,
+        agent_id=target_agent or "",
+        dry_run=dry_run,
+        on_progress=progress,
+    )
+
+    # Step 4 — preview file (no savings report: a static file has no plan delta).
+    preview_path = write_preview(rows, run_dir / "mapped_preview.json")
+
+    # Step 5 — summarize.
+    type_lines = (
+        ", ".join(f"{k}: {v}" for k, v in sorted(summary.type_counts.items())) or "—"
+    )
+    body_lines = [
+        f"[dim]Source records:[/dim] {summary.source_count}",
+        f"[dim]Mapped memories:[/dim] {summary.mapped_count}  "
+        f"[dim](skipped {summary.skipped} empty)[/dim]",
+        f"[dim]Type breakdown:[/dim] {type_lines}",
+    ]
+    if dry_run:
+        body_lines.append("")
+        body_lines.append("[yellow]Dry run — no writes performed.[/yellow]")
+    else:
+        body_lines.append(
+            f"[dim]Imported:[/dim] {summary.imported}  "
+            f"[dim]Failed:[/dim] {summary.failed}  "
+            f"[dim]Batches:[/dim] {summary.batches}"
+        )
+        body_lines.append(f"[dim]Target agent:[/dim] {target_agent}")
+
+    body_lines.append("")
+    body_lines.append(f"[dim]ChatGPT export (mapped):[/dim] {export_path}")
+    body_lines.append(f"[dim]Mapped preview:[/dim] {preview_path}")
+    body_lines.append(f"[dim]Run dir:[/dim] {run_dir}")
+    if summary.errors:
+        body_lines.append(
+            f"[red]First error:[/red] {summary.errors[0]}  "
+            "[dim](see run dir for more)[/dim]"
+        )
+
+    border = WARNING if summary.failed else SUCCESS
+    console.print()
+    console.print(
+        Panel(
+            "\n".join(body_lines),
+            title=(
+                "[bold yellow]Dry run complete[/bold yellow]"
+                if dry_run
+                else "[bold green]Migration complete[/bold green]"
+            ),
+            border_style=border,
+        )
+    )
+
+
+@migrate_app.command("chatgpt")
+def migrate_chatgpt(
+    file: Path | None = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="Your ChatGPT data export (conversations.json, or the unzipped folder).",
+    ),
+    user_only: bool = typer.Option(
+        False,
+        "--user-only",
+        help="Migrate only your own messages (closest to ChatGPT's saved 'memory').",
+    ),
+    agent: str | None = typer.Option(
+        None,
+        "--agent",
+        "-a",
+        help="Target Memanto agent id (defaults to the active agent).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview the mapping without writing.",
+    ),
+):
+    """Migrate a ChatGPT history (conversations.json) into the active agent.
+
+    Examples:
+        memanto migrate chatgpt --file ./conversations.json --dry-run
+        memanto migrate chatgpt --file ./conversations.json --user-only
+        memanto migrate chatgpt --file ./conversations.json --agent my-agent
+    """
+    _run_chatgpt_flow(
+        file=file,
+        include_assistant=not user_only,
+        agent=agent,
+        dry_run=dry_run,
     )
