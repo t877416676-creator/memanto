@@ -40,6 +40,7 @@ from memanto.cli.analyze.langfuse_export import (
     run_langfuse_export,
 )
 from memanto.cli.analyze.chatgpt_export import run_chatgpt_export
+from memanto.cli.analyze.claude_export import run_claude_export
 from memanto.cli.analyze.letta_compare import (
     build_llm_prompt as build_letta_llm_prompt,
 )
@@ -137,6 +138,14 @@ _PROVIDER_BUNDLES: dict[str, dict[str, Any]] = {
         "label": "ChatGPT",
         "exporter": run_chatgpt_export,
         "export_filename": "chatgpt_export.json",
+    },
+    # Claude is the same shape as ChatGPT: a static conversations.json export
+    # from claude.ai, parsed by the tolerant `claude_export` adapter. File-based,
+    # no API key, no savings report (see `_run_claude_flow`).
+    "claude": {
+        "label": "Claude",
+        "exporter": run_claude_export,
+        "export_filename": "claude_export.json",
     },
 }
 
@@ -1323,6 +1332,157 @@ def migrate_chatgpt(
         memanto migrate chatgpt --file ./conversations.json --agent my-agent
     """
     _run_chatgpt_flow(
+        file=file,
+        include_assistant=not user_only,
+        agent=agent,
+        dry_run=dry_run,
+    )
+
+
+# --------------------------------------------------------------------------
+# Claude — identical flow to ChatGPT, different file format and source label.
+# --------------------------------------------------------------------------
+
+
+def _run_claude_flow(
+    *,
+    file: Path | None,
+    include_assistant: bool,
+    agent: str | None,
+    dry_run: bool,
+) -> None:
+    """Migrate a Claude data export (conversations.json) into Memanto."""
+    bundle = _PROVIDER_BUNDLES["claude"]
+    label = bundle["label"]
+
+    if file is None:
+        _error(
+            "Claude migration needs your data export file.",
+            hint=(
+                "Request it from https://claude.ai/settings/data-privacy "
+                "(\"Export data\"), unzip the email, then pass "
+                "--file path/to/conversations.json"
+            ),
+        )
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_dir = config_manager.get_migrate_dir("claude") / stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    mode = "Dry run" if dry_run else "Migrate"
+    console.print(
+        Panel.fit(
+            f"[{BOLD_PRIMARY}]{label} -> Memanto  {mode}[/{BOLD_PRIMARY}]",
+            border_style=PRIMARY,
+        )
+    )
+
+    def progress(msg: str) -> None:
+        console.print(f"  [{BRIGHT}]…[/{BRIGHT}] {msg}")
+
+    target_agent = None if dry_run else _resolve_target_agent(agent)
+
+    try:
+        export_path, export = run_claude_export(
+            file,
+            run_dir,
+            include_assistant=include_assistant,
+            on_progress=progress,
+        )
+    except ValueError as exc:
+        _error(str(exc))
+
+    progress("Mapping Claude messages onto the Memanto schema...")
+    client = None if dry_run else get_client()
+    summary, rows = run_migration(
+        provider="claude",
+        export=export,
+        client=client,
+        agent_id=target_agent or "",
+        dry_run=dry_run,
+        on_progress=progress,
+    )
+
+    preview_path = write_preview(rows, run_dir / "mapped_preview.json")
+
+    type_lines = (
+        ", ".join(f"{k}: {v}" for k, v in sorted(summary.type_counts.items())) or "—"
+    )
+    body_lines = [
+        f"[dim]Source records:[/dim] {summary.source_count}",
+        f"[dim]Mapped memories:[/dim] {summary.mapped_count}  "
+        f"[dim](skipped {summary.skipped} empty)[/dim]",
+        f"[dim]Type breakdown:[/dim] {type_lines}",
+    ]
+    if dry_run:
+        body_lines.append("")
+        body_lines.append("[yellow]Dry run — no writes performed.[/yellow]")
+    else:
+        body_lines.append(
+            f"[dim]Imported:[/dim] {summary.imported}  "
+            f"[dim]Failed:[/dim] {summary.failed}  "
+            f"[dim]Batches:[/dim] {summary.batches}"
+        )
+        body_lines.append(f"[dim]Target agent:[/dim] {target_agent}")
+
+    body_lines.append("")
+    body_lines.append(f"[dim]Claude export (mapped):[/dim] {export_path}")
+    body_lines.append(f"[dim]Mapped preview:[/dim] {preview_path}")
+    body_lines.append(f"[dim]Run dir:[/dim] {run_dir}")
+    if summary.errors:
+        body_lines.append(
+            f"[red]First error:[/red] {summary.errors[0]}  "
+            "[dim](see run dir for more)[/dim]"
+        )
+
+    border = WARNING if summary.failed else SUCCESS
+    console.print()
+    console.print(
+        Panel(
+            "\n".join(body_lines),
+            title=(
+                "[bold yellow]Dry run complete[/bold yellow]"
+                if dry_run
+                else "[bold green]Migration complete[/bold green]"
+            ),
+            border_style=border,
+        )
+    )
+
+
+@migrate_app.command("claude")
+def migrate_claude(
+    file: Path | None = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="Your Claude data export (conversations.json, or the unzipped folder).",
+    ),
+    user_only: bool = typer.Option(
+        False,
+        "--user-only",
+        help="Migrate only your own messages.",
+    ),
+    agent: str | None = typer.Option(
+        None,
+        "--agent",
+        "-a",
+        help="Target Memanto agent id (defaults to the active agent).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview the mapping without writing.",
+    ),
+):
+    """Migrate a Claude history (conversations.json) into the active agent.
+
+    Examples:
+        memanto migrate claude --file ./conversations.json --dry-run
+        memanto migrate claude --file ./conversations.json --user-only
+        memanto migrate claude --file ./conversations.json --agent my-agent
+    """
+    _run_claude_flow(
         file=file,
         include_assistant=not user_only,
         agent=agent,
