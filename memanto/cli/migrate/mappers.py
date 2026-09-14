@@ -575,13 +575,24 @@ def map_okf(export: dict[str, Any]) -> list[dict[str, Any]]:
 
 def map_chatgpt(export: dict[str, Any]) -> list[dict[str, Any]]:
     """Map a ChatGPT conversation export (from ``chatgpt_export``) to Memanto
-    memory payloads.
+    memory payloads. See :func:`_map_conversation_export`."""
+    return _map_conversation_export(export, source="chatgpt")
 
-    Each source row is one message from a ChatGPT conversation. The message
-    text becomes the memory content; the conversation title and the speaker
-    role become tags so the migrated memories stay grouped and attributable.
-    Everything that has no schema slot (role, conversation id/title, source
-    message id) goes into the ``[Supporting data]`` footer.
+
+def map_claude(export: dict[str, Any]) -> list[dict[str, Any]]:
+    """Map a Claude conversation export (from ``claude_export``) to Memanto
+    memory payloads. Same shape as ChatGPT; only the source label differs so
+    migrated memories stay attributable to Claude."""
+    return _map_conversation_export(export, source="claude")
+
+
+def _map_conversation_export(export: dict[str, Any], *, source: str) -> list[dict[str, Any]]:
+    """Shared mapper for file-based conversation exports (ChatGPT, Claude).
+
+    Both exporters emit rows ``{id, memory, role, created_at, conversation_id,
+    conversation_title}``. Each becomes a Memanto memory payload: text ->
+    content, conversation title + role -> tags, and role/conversation/message
+    ids -> ``[Supporting data]`` footer.
     """
     rows: list[dict[str, Any]] = []
     migrated_at = _now_utc()
@@ -606,8 +617,8 @@ def map_chatgpt(export: dict[str, Any]) -> list[dict[str, Any]]:
         footer = _format_supporting_data(
             [
                 ("Source", mem.get("id")),
-                ("ChatGPT conversation", conv_title),
-                ("ChatGPT conversation id", conv_id),
+                (f"{source.capitalize()} conversation", conv_title),
+                (f"{source.capitalize()} conversation id", conv_id),
                 ("Role", role),
                 ("Source created_at", created_at.isoformat() if created_at else None),
             ]
@@ -620,7 +631,7 @@ def map_chatgpt(export: dict[str, Any]) -> list[dict[str, Any]]:
                 "type": None,
                 "tags": tags,
                 "confidence": 0.8,
-                "source": "chatgpt",
+                "source": source,
                 "source_ref": str(mem.get("id")) if mem.get("id") else None,
                 "provenance": "imported",
                 "created_at": created_at,
@@ -640,6 +651,7 @@ MAPPERS: dict[str, Callable[[dict[str, Any]], list[dict[str, Any]]]] = {
     "supermemory": map_supermemory,
     "okf": map_okf,
     "chatgpt": map_chatgpt,
+    "claude": map_claude,
 }
 
 
