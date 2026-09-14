@@ -568,6 +568,68 @@ def map_okf(export: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+# --------------------------------------------------------------------------
+# ChatGPT
+# --------------------------------------------------------------------------
+
+
+def map_chatgpt(export: dict[str, Any]) -> list[dict[str, Any]]:
+    """Map a ChatGPT conversation export (from ``chatgpt_export``) to Memanto
+    memory payloads.
+
+    Each source row is one message from a ChatGPT conversation. The message
+    text becomes the memory content; the conversation title and the speaker
+    role become tags so the migrated memories stay grouped and attributable.
+    Everything that has no schema slot (role, conversation id/title, source
+    message id) goes into the ``[Supporting data]`` footer.
+    """
+    rows: list[dict[str, Any]] = []
+    migrated_at = _now_utc()
+
+    for mem in export.get("memories", []) or []:
+        content = (mem.get("memory") or mem.get("content") or "").strip()
+        if not content:
+            continue
+
+        role = (mem.get("role") or "").strip() or None
+        conv_title = (mem.get("conversation_title") or "").strip() or None
+        conv_id = mem.get("conversation_id")
+
+        tags: list[str] = []
+        if conv_title:
+            tags.append(conv_title)
+        if role:
+            tags.append(f"role={role}")
+
+        created_at = _pick_first_dt(mem, ("created_at", "create_time", "createdAt"))
+
+        footer = _format_supporting_data(
+            [
+                ("Source", mem.get("id")),
+                ("ChatGPT conversation", conv_title),
+                ("ChatGPT conversation id", conv_id),
+                ("Role", role),
+                ("Source created_at", created_at.isoformat() if created_at else None),
+            ]
+        )
+
+        rows.append(
+            {
+                "title": _title_from(content),
+                "content": _attach_footer(content, footer),
+                "type": None,
+                "tags": tags,
+                "confidence": 0.8,
+                "source": "chatgpt",
+                "source_ref": str(mem.get("id")) if mem.get("id") else None,
+                "provenance": "imported",
+                "created_at": created_at,
+                "updated_at": migrated_at,
+            }
+        )
+    return rows
+
+
 # Langfuse is deliberately absent: its rows are observability events, not
 # memories, so one incident collapses into a single grouped payload rather
 # than mapping row-for-row. That needs the user's capture settings, which
@@ -577,6 +639,7 @@ MAPPERS: dict[str, Callable[[dict[str, Any]], list[dict[str, Any]]]] = {
     "letta": map_letta,
     "supermemory": map_supermemory,
     "okf": map_okf,
+    "chatgpt": map_chatgpt,
 }
 
 
